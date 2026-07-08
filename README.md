@@ -6,19 +6,42 @@ not commands.
 
 ## Architecture
 
-```
-docs/*.md ──> heading-aware chunking ──> local embeddings (MiniLM) ──> FAISS index
-                                                                          │
-user question ──> embed ──> top-k retrieval ──> refusal threshold ──> Groq LLM
-                                                                          │
-                                              post-hoc citation verification
-                                                                          │
-                                    {answer, citations[{doc, quote}], answered}
+**Indexing** — runs once at startup, entirely on-machine (no API calls):
+
+```mermaid
+flowchart LR
+    A["docs/*.md"] --> B["Heading-aware<br/>chunking"]
+    B --> C["MiniLM embeddings<br/>(local, 384-dim)"]
+    C --> D[("FAISS index<br/>cosine similarity")]
 ```
 
-- **Embeddings:** `sentence-transformers/all-MiniLM-L6-v2`, generated locally (no API needed).
-- **Vector store:** FAISS (cosine similarity via normalized inner product).
-- **LLM:** Groq (`llama-3.3-70b-versatile` by default), strict-JSON grounded prompt.
+**Answering** — per `POST /ask` request. A question must clear **three gates**
+before it can come back as an answer:
+
+```mermaid
+flowchart TD
+    Q["POST /ask"] --> E["Embed question<br/>(same MiniLM)"]
+    E --> F["Top-6 retrieval<br/>from FAISS"]
+    F --> G{"Gate 1<br/>evidence above<br/>similarity floor?"}
+    G -- no --> R["answered: false<br/><i>refuse without calling the LLM</i>"]
+    G -- yes --> H["Groq LLM<br/>grounded prompt, temp 0,<br/>excerpts tagged as untrusted data"]
+    H --> I{"Gate 2<br/>model says the docs<br/>support an answer?"}
+    I -- no --> R
+    I -- yes --> J{"Gate 3<br/>every cited quote found<br/>verbatim in the source doc?"}
+    J -- no --> R2["downgraded to refusal<br/><i>unsupported answer never ships</i>"]
+    J -- yes --> OK["answer + citations<br/>{doc, quote} - answered: true"]
+
+    style OK stroke:#2da44e,stroke-width:2px
+    style R stroke:#cf222e,stroke-width:2px
+    style R2 stroke:#cf222e,stroke-width:2px
+```
+
+| Component | Choice | Why |
+| --- | --- | --- |
+| Embeddings | `all-MiniLM-L6-v2`, run locally | No API key or network needed for retrieval; free and fast |
+| Vector store | FAISS `IndexFlatIP` (exact search) | 10 docs → exact search is instant, zero recall loss, zero infrastructure |
+| LLM | Groq `llama-3.3-70b-versatile` | Free tier, strong instruction-following; output shape enforced at the API layer |
+| API | FastAPI + Pydantic | Response schema validated on the way out |
 
 ## Run (one command)
 
@@ -60,13 +83,6 @@ Runs every question in `eval/questions.json` through the live pipeline and print
 answer accuracy on `grounded`, refusal rate on `refusal`, and pass rate on
 `adversarial` (grounded/adversarial correctness is checked by an LLM judge).
 
-### Our numbers
-
-| Metric | Score |
-| --- | --- |
-| Answer accuracy (grounded) | **9/9 = 100%** |
-| Refusal rate (refusal) | **5/5 = 100%** |
-| Pass rate (adversarial) | **4/4 = 100%** |
 
 ## Key design points (details in DESIGN.md)
 
