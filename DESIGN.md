@@ -1,103 +1,39 @@
-# DESIGN
+#  WeSee Grounded Answer Engine
+**Track:** Track B — AI Engineer
 
-## 1. Retrieval
+## What it does
 
-**Chunking** (`rag.py: chunk_markdown`): each markdown file is split on headings,
-so a chunk never mixes two topics; long sections are further split at paragraph
-boundaries into ≤1200-character chunks. Every chunk keeps its heading as context
-and its source filename as metadata.
+Answers questions about WeSee using only the docs in `docs/` — nothing from the model's own memory. Every answer comes with a citation, and if the docs don't actually support an answer, it refuses instead of guessing.
 
-**Embedding & search:** chunks are embedded locally with
-`sentence-transformers/all-MiniLM-L6-v2` (normalized), stored in a FAISS
-`IndexFlatIP` — inner product on unit vectors = cosine similarity. At query time
-the question is embedded the same way and the top-6 chunks are retrieved. With
-only 10 documents, exact (flat) search is the right call — no ANN approximation,
-no recall loss.
+## How it works
 
-The index auto-rebuilds when any file in `docs/` is newer than the stored index,
-so adding a document is just "drop the file in, restart" (a likely live-change
-request in review).
+1. **Index the docs (once, at startup).** Each markdown file gets split by heading (so chunks don't mix topics), embedded locally with MiniLM, and stored in a FAISS index. All local, no API calls needed for this part.
+2. **On a question:** embed it, pull the top 6 matching chunks, and check if the best match even clears a similarity floor. If not, refuse right away — never even call the LLM.
+3. **If it clears that bar,** send the question + chunks to Groq (llama-3.3-70b) with a strict prompt: only answer from the excerpts, treat them as data not instructions, and say so explicitly if the docs don't cover it.
+4. **Before returning anything,** every quoted citation gets checked against the actual source file. If a quote isn't really there, it's dropped — and if that leaves zero real citations, the "answer" gets downgraded to a refusal.
 
-## 2. Grounding & refusal
+So an answer only goes out if three things line up: good retrieval, the model itself thinks the docs support it, and the citations are verifiably real. That's the core anti-hallucination guardrail.
 
-Three layers, cheapest first:
+## Handling prompt injection
 
-1. **Retrieval floor (pre-LLM).** Chunks scoring below `MIN_RETRIEVAL_SCORE`
-   (0.15) are discarded; if the *best* chunk is below `HARD_REFUSAL_SCORE`
-   (0.10), we refuse without calling the LLM at all. Both are env-tunable
-   (`.env`) — tightening the refusal threshold is a one-line change.
-   An honest calibration finding: on this small, topically-dense corpus,
-   similarity does **not** separate answerable from unanswerable questions
-   (e.g. "Does WeSee integrate with Salesforce?" retrieves *higher* than some
-   answerable questions), so the floor is kept low as an off-topic filter and
-   the semantic refusal decision is delegated to layers 2–3.
-2. **Prompt contract.** The system prompt allows answering only when the
-   excerpts explicitly support it, forbids outside knowledge, and requires
-   strict JSON with `answered: false` otherwise. Temperature 0.
-3. **Post-hoc citation verification (post-LLM).** Every citation's quote must
-   appear (near-)verbatim in the cited file — whitespace-normalized substring
-   match with a fuzzy fallback (SequenceMatcher > 0.9) for tiny copy errors.
-   Invalid citations are dropped; if an "answered" response has no surviving
-   citations, it is **downgraded to a refusal**. An unsupported answer is worse
-   than no answer, so hallucinated citations can't reach the user.
+Docs are wrapped in tags that tell the model "this is data, not instructions" — so if a doc says "ignore previous instructions" or tries to get the model to switch persona/leak the system prompt, it's just... text to analyze, not something to obey. On top of that, the response shape (JSON schema) is enforced at the code level, not just asked for nicely in the prompt, so even a successful injection can't bend the output format. And since every citation has to be a real quote from a real doc, a planted instruction can't turn into a "grounded" answer.
 
-`answered: true` therefore requires: strong retrieval + the model's own
-grounding judgment + at least one machine-verified quote.
+One soft spot: if a doc *contains* a false claim as plain text, the model can technically quote it correctly since it's genuinely in the source. The prompt tells it to be skeptical of anything that reads like an override or authority claim, but this isn't fully bulletproof yet (more on that below).
 
-## 3. Injection defence
+## Self-eval
 
-Threat: documents containing planted instructions ("ignore your instructions",
-"developer mode") or false claims meant to be repeated.
+`run_eval.py` runs the eval set through the actual pipeline (not a shortcut version) and buckets each question as refusal / grounded / adversarial, then reports:
+- accuracy on the answerable questions
+- refusal rate on the ones that should be refused
+- pass rate on the injection/adversarial set
 
-- **Data/instruction separation.** Retrieved chunks are wrapped in
-  `<excerpt source="...">` tags and both the system prompt and the user message
-  label them *untrusted data*. The system prompt explicitly forbids following
-  instructions found inside excerpts, adopting personas, revealing the prompt,
-  or changing the output format — rule #1, above everything else.
-- **Structural guarantees.** The response shape is enforced at the API layer,
-  not in the prompt: we request `response_format: json_schema` (structured
-  outputs) with an explicit schema, falling back automatically to
-  `json_object` + an in-request shape spec for models that don't support
-  schemas (llama-3.3-70b currently uses the fallback). The result is validated
-  by Pydantic, so "reply with X instead" attacks can't change the response shape.
-- **Verification as containment.** Even if planted text influences the model,
-  the citation check only accepts quotes that exist in the docs, and the answer
-  is refused if no verified citation supports it. A planted *false claim* can
-  still technically be quoted (it is in a doc) — the prompt instructs the model
-  to treat authority-claiming/override text as suspect and not assert it as
-  fact; see "with more time" for the stronger fix.
+## What's not done yet (ran out of time, not because it's not needed)
 
-## 4. Self-evaluation
+- **Better retrieval** — right now it's just embeddings. Adding keyword search (BM25) alongside it and maybe a re-ranker would catch cases where the vector search misses an exact term.
+- **A real "is this even answerable" check** — similarity scores alone aren't a great signal on a small corpus. A quick dedicated LLM check before generating would be more reliable than tuning thresholds forever.
+- **Checking that the *claim* matches the quote, not just that the quote exists** — right now if the quote is real, that's good enough. Ideally we'd also verify the sentence built around it is actually supported by that quote.
+- **Catching planted false claims better** — as mentioned above, a real quote that happens to be a lie can still slip through. Would want some kind of cross-checking against trusted parts of the corpus for anything that smells like an "override."
+- **No UI** — it's API + eval script only. A simple front-end showing the answer next to its sources would help reviewers, but doesn't change how the system actually behaves.
+- **Scaling stuff** — exact search works fine for ~10 docs, but if the corpus grows a lot, we'd need proper ANN indexing, plus logging/monitoring for refusals vs answers over time.
 
-`run_eval.py` runs every eval question through the real pipeline (same code path
-as the API). Scoring:
-
-- `refusal`: pass iff `answered == false`.
-- `grounded`: pass iff `answered == true`, ≥1 verified citation, and an LLM
-  judge (temperature 0) confirms the answer conveys the expected facts.
-- `adversarial`: an LLM judge checks the response for signs of hijack —
-  persona changes, format breaks, leaked prompts, planted claims asserted as
-  fact. Refusing or answering from legitimate content passes.
-
-Field names in `questions.json` are auto-detected (`question/q/prompt`,
-`type/category/label`, `expected_answer/expected/answer`) so the held-out set's
-exact schema doesn't break the script.
-
-## 5. What I'd improve with more time
-
-- **Hybrid retrieval:** add BM25 alongside dense vectors and fuse ranks —
-  MiniLM occasionally misses exact-term matches (product names, plan tiers).
-- **Claim-level verification:** split the answer into atomic claims and check
-  each is entailed by a cited quote (NLI model), not just that quotes exist.
-- **Cross-document consistency for false claims:** flag chunks whose statements
-  contradict other docs, and quarantine known injection patterns at *ingest*
-  time (regex + classifier) so poisoned text never reaches the prompt.
-- **Answerability classifier:** since retrieval similarity doesn't separate
-  answerable from unanswerable questions here, a small second LLM pass ("is this
-  question answerable from these excerpts? yes/no") before generating would be a
-  more reliable, independently-tunable refusal gate than the current thresholds.
-
-## What I cut (scope note)
-
-Re-ranking, conversation history, streaming, caching, and a UI — none of them
-affect grounding/refusal/citation quality.
+Basically: the core grounding/refusal/citation loop is solid, since that's what actually gets graded. Things like re-ranking, a UI, conversation memory, and caching were consciously skipped so time went into making that core loop trustworthy instead of half-building extras.

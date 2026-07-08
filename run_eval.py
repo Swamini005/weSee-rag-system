@@ -109,6 +109,9 @@ def main():
         category = str(_field(item, "type", "category", "label", default="grounded")).lower()
         question = _field(item, "question", "q", "prompt", default="")
         result = rag.answer_question(question)
+        if "temporarily unavailable" in result["answer"]:
+            sys.exit("\nAborting: the LLM is rate-limited/unreachable, so eval numbers "
+                     "would be meaningless. Wait for the quota window or switch GROQ_MODEL.")
         ok = grade(item, result)
         buckets.setdefault(category, []).append(ok)
         status = "PASS" if ok else "FAIL"

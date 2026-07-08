@@ -349,8 +349,18 @@ def answer_question(question: str) -> dict:
     except Exception:
         # One retry; Groq free tier occasionally rate-limits.
         import time
-        time.sleep(2)
-        raw = _call_groq(question, hits)
+        time.sleep(5)
+        try:
+            raw = _call_groq(question, hits)
+        except Exception:
+            # Degrade gracefully instead of returning HTTP 500: keep the response
+            # contract and say plainly that this is an outage, not a refusal.
+            return {
+                "answer": "The language model behind this service is temporarily "
+                          "unavailable (rate limit or network error). Please retry shortly.",
+                "citations": [],
+                "answered": False,
+            }
 
     return verify_citations(raw)
 
